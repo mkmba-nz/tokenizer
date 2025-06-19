@@ -23,7 +23,7 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
-    uses: mkmba-nz/github-infra/.github/workflows/build-and-push.yml@HEAD
+    uses: mkmba-nz/github-infra/.github/workflows/build-and-push.yml@main
     secrets: inherit
     with:
       repo-name: tokenizer
@@ -33,7 +33,7 @@ jobs:
       needs: build-and-push-tokenizer
       concurrency:
         group: ${{ github.workflow }}-${{ github.ref }}
-      uses: mkmba-nz/github-infra/.github/workflows/deploy-to-ecs.yml@HEAD
+      uses: mkmba-nz/github-infra/.github/workflows/deploy-to-ecs.yml@main
       secrets: inherit
       with:
         region: ap-southeast-2
