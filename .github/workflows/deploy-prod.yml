@@ -11,7 +11,7 @@ jobs:
   deploy:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-tokenizer
-    uses: mkmba-nz/github-infra/.github/workflows/deploy-to-ecs.yml@HEAD
+    uses: mkmba-nz/github-infra/.github/workflows/deploy-to-ecs.yml@main
     secrets: inherit
     with:
       region: us-east-2
