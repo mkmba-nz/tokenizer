@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/icholy/replace"
 	"golang.org/x/exp/slices"
 )
 
@@ -37,6 +38,10 @@ const (
 	// ParamSubtoken optionally specifies which subtoken should be used.
 	// Default is SubtokenAccessToken.
 	ParamSubtoken = "st"
+
+	// ParamPlaceholder specifies the placeholder pattern to replace in the
+	// request body with the token value. Used by InjectBodyProcessor.
+	ParamPlaceholder = "placeholder"
 )
 
 const (
@@ -48,12 +53,15 @@ type RequestProcessor func(r *http.Request) error
 
 type ProcessorConfig interface {
 	Processor(map[string]string) (RequestProcessor, error)
+	StripHazmat() ProcessorConfig
 }
 
 type wireProcessor struct {
 	InjectProcessorConfig     *InjectProcessorConfig     `json:"inject_processor,omitempty"`
 	InjectHMACProcessorConfig *InjectHMACProcessorConfig `json:"inject_hmac_processor,omitempty"`
+	InjectBodyProcessorConfig *InjectBodyProcessorConfig `json:"inject_body_processor,omitempty"`
 	OAuthProcessorConfig      *OAuthProcessorConfig      `json:"oauth2_processor,omitempty"`
+	OAuthBodyProcessorConfig  *OAuthBodyProcessorConfig  `json:"oauth2_body_processor,omitempty"`
 	Sigv4ProcessorConfig      *Sigv4ProcessorConfig      `json:"sigv4_processor,omitempty"`
 	MultiProcessorConfig      *MultiProcessorConfig      `json:"multi_processor,omitempty"`
 }
@@ -64,8 +72,12 @@ func newWireProcessor(p ProcessorConfig) (wireProcessor, error) {
 		return wireProcessor{InjectProcessorConfig: p}, nil
 	case *InjectHMACProcessorConfig:
 		return wireProcessor{InjectHMACProcessorConfig: p}, nil
+	case *InjectBodyProcessorConfig:
+		return wireProcessor{InjectBodyProcessorConfig: p}, nil
 	case *OAuthProcessorConfig:
 		return wireProcessor{OAuthProcessorConfig: p}, nil
+	case *OAuthBodyProcessorConfig:
+		return wireProcessor{OAuthBodyProcessorConfig: p}, nil
 	case *Sigv4ProcessorConfig:
 		return wireProcessor{Sigv4ProcessorConfig: p}, nil
 	case *MultiProcessorConfig:
@@ -87,9 +99,17 @@ func (wp *wireProcessor) getProcessorConfig() (ProcessorConfig, error) {
 		np += 1
 		p = wp.InjectHMACProcessorConfig
 	}
+	if wp.InjectBodyProcessorConfig != nil {
+		np += 1
+		p = wp.InjectBodyProcessorConfig
+	}
 	if wp.OAuthProcessorConfig != nil {
 		np += 1
 		p = wp.OAuthProcessorConfig
+	}
+	if wp.OAuthBodyProcessorConfig != nil {
+		np += 1
+		p = wp.OAuthBodyProcessorConfig
 	}
 	if wp.Sigv4ProcessorConfig != nil {
 		np += 1
@@ -127,6 +147,15 @@ func (c *InjectProcessorConfig) Processor(params map[string]string) (RequestProc
 	return func(r *http.Request) error {
 		return c.ApplyDst(params, r, val)
 	}, nil
+}
+
+func (c *InjectProcessorConfig) StripHazmat() ProcessorConfig {
+	// DO NOT PUT HAZMAT INTO FmtProcessor or DstProcessor.
+	return &InjectProcessorConfig{
+		Token:        redactedStr,
+		FmtProcessor: c.FmtProcessor,
+		DstProcessor: c.DstProcessor,
+	}
 }
 
 type InjectHMACProcessorConfig struct {
@@ -178,6 +207,61 @@ func (c *InjectHMACProcessorConfig) Processor(params map[string]string) (Request
 	}, nil
 }
 
+func (c *InjectHMACProcessorConfig) StripHazmat() ProcessorConfig {
+	// DO NOT PUT HAZMAT INTO FmtProcessor or DstProcessor.
+	return &InjectHMACProcessorConfig{
+		Key:          redactedBase64,
+		Hash:         redactedStr,
+		FmtProcessor: c.FmtProcessor,
+		DstProcessor: c.DstProcessor,
+	}
+}
+
+type InjectBodyProcessorConfig struct {
+	Token       string `json:"token"`
+	Placeholder string `json:"placeholder,omitempty"`
+}
+
+var _ ProcessorConfig = new(InjectBodyProcessorConfig)
+
+func (c *InjectBodyProcessorConfig) Processor(params map[string]string) (RequestProcessor, error) {
+	if c.Token == "" {
+		return nil, errors.New("missing token")
+	}
+
+	// Get placeholder from params or use config default or fallback
+	placeholder := c.Placeholder
+	if paramPlaceholder, ok := params[ParamPlaceholder]; ok {
+		placeholder = paramPlaceholder
+	}
+	if placeholder == "" {
+		placeholder = "{{ACCESS_TOKEN}}"
+	}
+
+	return func(r *http.Request) error {
+		if r.Body == nil {
+			return nil
+		}
+
+		// Use streaming replacement to avoid loading entire body into memory
+		chain := replace.Chain(r.Body, replace.String(placeholder, c.Token))
+
+		// Set body to the replacement chain for true streaming with chunked encoding
+		// Setting ContentLength to 0 triggers chunked transfer encoding
+		r.Body = io.NopCloser(chain)
+		r.ContentLength = 0
+
+		return nil
+	}, nil
+}
+
+func (c *InjectBodyProcessorConfig) StripHazmat() ProcessorConfig {
+	return &InjectBodyProcessorConfig{
+		Token:       redactedStr,
+		Placeholder: c.Placeholder,
+	}
+}
+
 type OAuthProcessorConfig struct {
 	Token *OAuthToken `json:"token"`
 }
@@ -199,10 +283,93 @@ func (c *OAuthProcessorConfig) Processor(params map[string]string) (RequestProce
 		return nil, errors.New("missing token")
 	}
 
+	// Check if placeholder parameter is present for body injection
+	if placeholder, ok := params[ParamPlaceholder]; ok && placeholder != "" {
+		// Inject token into request body by replacing placeholder
+		return func(r *http.Request) error {
+			if r.Body == nil {
+				return nil
+			}
+
+			// Use streaming replacement to avoid loading entire body into memory
+			chain := replace.Chain(r.Body, replace.String(placeholder, token))
+
+			// Set body to the replacement chain for true streaming with chunked encoding
+			// Setting ContentLength to 0 triggers chunked transfer encoding
+			r.Body = io.NopCloser(chain)
+			r.ContentLength = 0
+
+			return nil
+		}, nil
+	}
+
+	// Default behavior: inject into Authorization header
 	return func(r *http.Request) error {
 		r.Header.Set("Authorization", "Bearer "+token)
 		return nil
 	}, nil
+}
+
+func (c *OAuthProcessorConfig) StripHazmat() ProcessorConfig {
+	return &OAuthProcessorConfig{
+		Token: &OAuthToken{
+			AccessToken:  redactedStr,
+			RefreshToken: redactedStr,
+		},
+	}
+}
+
+type OAuthBodyProcessorConfig struct {
+	Token       *OAuthToken `json:"token"`
+	Placeholder string      `json:"placeholder,omitempty"`
+}
+
+var _ ProcessorConfig = (*OAuthBodyProcessorConfig)(nil)
+
+func (c *OAuthBodyProcessorConfig) Processor(params map[string]string) (RequestProcessor, error) {
+	token := c.Token.AccessToken
+	if params[ParamSubtoken] == SubtokenRefresh {
+		token = c.Token.RefreshToken
+	}
+
+	if token == "" {
+		return nil, errors.New("missing token")
+	}
+
+	// Get placeholder from params or use config default or fallback
+	placeholder := c.Placeholder
+	if paramPlaceholder, ok := params[ParamPlaceholder]; ok {
+		placeholder = paramPlaceholder
+	}
+	if placeholder == "" {
+		placeholder = "{{ACCESS_TOKEN}}"
+	}
+
+	return func(r *http.Request) error {
+		if r.Body == nil {
+			return nil
+		}
+
+		// Use streaming replacement to avoid loading entire body into memory
+		chain := replace.Chain(r.Body, replace.String(placeholder, token))
+
+		// Set body to the replacement chain for true streaming with chunked encoding
+		// Setting ContentLength to 0 triggers chunked transfer encoding
+		r.Body = io.NopCloser(chain)
+		r.ContentLength = 0
+
+		return nil
+	}, nil
+}
+
+func (c *OAuthBodyProcessorConfig) StripHazmat() ProcessorConfig {
+	return &OAuthBodyProcessorConfig{
+		Token: &OAuthToken{
+			AccessToken:  redactedStr,
+			RefreshToken: redactedStr,
+		},
+		Placeholder: c.Placeholder,
+	}
 }
 
 type Sigv4ProcessorConfig struct {
@@ -299,6 +466,13 @@ func (c *Sigv4ProcessorConfig) Processor(params map[string]string) (RequestProce
 	}, nil
 }
 
+func (c *Sigv4ProcessorConfig) StripHazmat() ProcessorConfig {
+	return &Sigv4ProcessorConfig{
+		AccessKey: redactedStr,
+		SecretKey: redactedStr,
+	}
+}
+
 type MultiProcessorConfig []ProcessorConfig
 
 var _ ProcessorConfig = new(MultiProcessorConfig)
@@ -321,6 +495,14 @@ func (c MultiProcessorConfig) Processor(params map[string]string) (RequestProces
 		}
 		return nil
 	}, nil
+}
+
+func (c *MultiProcessorConfig) StripHazmat() ProcessorConfig {
+	ret := make(MultiProcessorConfig, len(*c))
+	for n, p := range *c {
+		ret[n] = p.StripHazmat()
+	}
+	return &ret
 }
 
 func (c MultiProcessorConfig) MarshalJSON() ([]byte, error) {

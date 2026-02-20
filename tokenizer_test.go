@@ -22,8 +22,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 	"github.com/sirupsen/logrus"
+	"github.com/superfly/flysrc-go"
 	"github.com/superfly/macaroon"
-	"github.com/superfly/tokenizer/flysrc"
 	tkmac "github.com/superfly/tokenizer/macaroon"
 	"golang.org/x/crypto/nacl/box"
 )
@@ -45,7 +45,21 @@ func TestTokenizer(t *testing.T) {
 		openKey      = hex.EncodeToString(priv[:])
 	)
 
+	flysrcParser, err := flysrc.New(
+		flysrc.WithPubkey(flySrcVerifyKey(t)),
+		flysrc.WithFlyProxyNet(&net.IPNet{
+			IP:   net.ParseIP("127.0.0.1"),
+			Mask: net.CIDRMask(16, 32),
+		}),
+	)
+
+	assert.NoError(t, err)
+
+	// we can build a server without a fly src parser
 	tkz := NewTokenizer(openKey)
+	assert.True(t, tkz != nil)
+
+	tkz = NewTokenizer(openKey, WithFlysrcParser(flysrcParser))
 	tkz.ProxyHttpServer.Verbose = true
 
 	tkzServer := httptest.NewServer(tkz)
@@ -388,7 +402,7 @@ func TestTokenizer(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Good
-		fs := &flysrc.Parsed{Org: "foo", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
+		fs := &flysrc.FlySrc{Org: "foo", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
 		hdrSrc := fs.String()
 		hdrSig := fs.Sign(priv)
 
@@ -407,8 +421,16 @@ func TestTokenizer(t *testing.T) {
 			Body: "",
 		}, doEcho(t, client, req))
 
+		// Bad, the same request fails, without panic, if flysrc parser is nil
+		parser := tkz.flysrcParser
+		tkz.flysrcParser = nil
+		resp, err = client.Do(req)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusProxyAuthRequired, resp.StatusCode)
+		tkz.flysrcParser = parser
+
 		// Bad org
-		fs = &flysrc.Parsed{Org: "WRONG!", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
+		fs = &flysrc.FlySrc{Org: "WRONG!", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
 		hdrSrc = fs.String()
 		hdrSig = fs.Sign(priv)
 
@@ -424,7 +446,7 @@ func TestTokenizer(t *testing.T) {
 		assert.Equal(t, http.StatusProxyAuthRequired, resp.StatusCode)
 
 		// Missing signature
-		fs = &flysrc.Parsed{Org: "foo", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
+		fs = &flysrc.FlySrc{Org: "foo", App: "bar", Instance: "baz", Timestamp: time.Now().Truncate(time.Second)}
 		hdrSrc = fs.String()
 
 		assert.NoError(t, err)
@@ -525,7 +547,8 @@ func hmacSHA256(t testing.TB, key []byte, msg string) []byte {
 
 var (
 	_setupFlySrcSignKey sync.Once
-	_flySrcsignKey      ed25519.PrivateKey
+	_flySrcSignKey      ed25519.PrivateKey
+	_flySrcVerifyKey    ed25519.PublicKey
 )
 
 func flySrcSignKey(t *testing.T) ed25519.PrivateKey {
@@ -534,10 +557,16 @@ func flySrcSignKey(t *testing.T) ed25519.PrivateKey {
 	var err error
 
 	_setupFlySrcSignKey.Do(func() {
-		flysrc.VerifyKey, _flySrcsignKey, err = ed25519.GenerateKey(nil)
+		_flySrcVerifyKey, _flySrcSignKey, err = ed25519.GenerateKey(nil)
 	})
 
 	assert.NoError(t, err)
-	assert.NotZero(t, _flySrcsignKey)
-	return _flySrcsignKey
+	assert.NotZero(t, _flySrcSignKey)
+	return _flySrcSignKey
+}
+
+func flySrcVerifyKey(t *testing.T) ed25519.PublicKey {
+	t.Helper()
+	_ = flySrcSignKey(t)
+	return _flySrcVerifyKey
 }
