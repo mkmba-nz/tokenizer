@@ -17,6 +17,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/superfly/tokenizer"
 	"golang.org/x/exp/slices"
+
+	"github.com/superfly/flysrc-go"
 )
 
 // Package variables can be overridden at build time:
@@ -32,6 +34,7 @@ var (
 
 var (
 	versionFlag = flag.Bool("version", false, "print the version number")
+	sealKeyFlag = flag.Bool("sealkey", false, "print the seal key and exit")
 )
 
 func init() {
@@ -57,6 +60,8 @@ func main() {
 	switch {
 	case *versionFlag:
 		runVersion()
+	case *sealKeyFlag:
+		runSealKey()
 	default:
 		runServe()
 	}
@@ -75,7 +80,7 @@ func runServe() {
 
 	key := os.Getenv("OPEN_KEY")
 	if key == "" {
-		fmt.Fprintf(os.Stderr, "missing OPEN_KEY")
+		fmt.Fprintf(os.Stderr, "missing OPEN_KEY\n")
 		os.Exit(1)
 	}
 
@@ -87,6 +92,21 @@ func runServe() {
 
 	if slices.Contains([]string{"1", "true"}, os.Getenv("OPEN_PROXY")) {
 		opts = append(opts, tokenizer.OpenProxy())
+	}
+
+	if slices.Contains([]string{"1", "true"}, os.Getenv("REQUIRE_FLY_SRC")) {
+		opts = append(opts, tokenizer.RequireFlySrc())
+	}
+
+	if slices.Contains([]string{"1", "true"}, os.Getenv("NO_FLY_SRC")) {
+		// nothing
+	} else {
+		parser, err := flysrc.New()
+		if err != nil {
+			logrus.WithError(err).Panic("Error making flysrc parser")
+		}
+
+		opts = append(opts, tokenizer.WithFlysrcParser(parser))
 	}
 
 	tkz := tokenizer.NewTokenizer(key, opts...)
@@ -137,6 +157,17 @@ func handleSignals(server *http.Server) {
 	}
 }
 
+func runSealKey() {
+	key := os.Getenv("OPEN_KEY")
+	if key == "" {
+		fmt.Fprintf(os.Stderr, "missing OPEN_KEY\n")
+		os.Exit(1)
+	}
+
+	tkz := tokenizer.NewTokenizer(key)
+	fmt.Fprintf(os.Stderr, "export SEAL_KEY=%v\n", tkz.SealKey())
+}
+
 var Version = ""
 
 func runVersion() {
@@ -175,8 +206,7 @@ func versionString() string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `
-tokenizer is an HTTP proxy that injects third party authentication credentials into requests
+	fmt.Fprintf(os.Stderr, `tokenizer is an HTTP proxy that injects third party authentication credentials into requests
 
 Usage:
 
@@ -194,7 +224,7 @@ Configuration — tokenizer is configured using the following environment variab
     LISTEN_ADDRESS   - The host:port address to listen at. Default: ":8080"
     FILTERED_HEADERS - Comma separated list of headers to filter from client
                        requests.
-`[1:])
+`)
 }
 
 type debugListener struct {
