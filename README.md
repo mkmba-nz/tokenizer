@@ -2,6 +2,16 @@
 
 Tokenizer is an HTTP proxy that injects third party authentication credentials into requests. Clients encrypt third party secrets using the proxy's public key. When the client wants to send a request to the third party service, it does so via the proxy, sending along the encrypted secret in the `Proxy-Tokenizer` header. The proxy decrypts the secret and injects it into the client's request. To ensure that encrypted secrets can only be used by authorized clients, the encrypted data also includes instructions on authenticating the client.
 
+# Docs
+
+More docs can be found under [docs/](docs/):
+
+* [The Fly tokenizer](docs/FlyTokenizer.md) describes the tokenizer that Fly runs.
+* [Quick start](docs/QuickStart.md) describes how to quickly setup, run, and use your own tokenizer.
+* [User guide](docs/UserGuide.md) describes how to seal tokens and make requests through the tokenizer with them.
+
+# Example
+
 Here's an example secret that the client encrypts using the proxy's public key:
 
 ```ruby
@@ -79,6 +89,90 @@ secret = {
 }
 ```
 
+### SigV4 processor
+
+The `sigv4_processor` re-signs AWS requests with SigV4 credentials. It parses the existing `Authorization` header to extract the service, region, and date, then re-signs the request with the sealed AWS credentials.
+
+```ruby
+secret = {
+    sigv4_processor: {
+        access_key: "AKIAIOSFODNN7EXAMPLE",
+        secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        no_swap: true
+    },
+    bearer_auth: {
+        digest: Digest::SHA256.base64digest('trustno1')
+    }
+}
+```
+
+Note: the `no_swap` field controls a bug-compatibility mode. When `false` (the default for backward compatibility), the region and service values extracted from the credential scope are swapped before re-signing. Set `no_swap: true` for correct behavior with new secrets.
+
+### JWT processor
+
+The `jwt_processor` handles Google Cloud service account authentication (and other OAuth2 JWT-bearer flows per [RFC 7523](https://tools.ietf.org/html/rfc7523)). It signs a JWT with the sealed private key and exchanges it for a short-lived access token at the token endpoint. RSA (RS256), ECDSA (ES256/ES384/ES512), and Ed25519 (EdDSA) keys are supported - the signing algorithm is chosen automatically based on the key type.
+
+This processor is unique in two ways:
+1. **It transforms both the request and the response.** On the request side, it builds the JWT and constructs the token exchange POST body. On the response side, it intercepts the token endpoint's response, extracts the access token, seals it into a new `inject_processor` secret, and replaces the response body.
+2. **The caller never sees any plaintext credential.** The private key, the signed JWT, and the access token are all plaintext only inside tokenizer's process memory. The caller receives an opaque sealed blob.
+
+```ruby
+secret = {
+    jwt_processor: {
+        private_key: File.read("service-account-key.pem"),
+        email: "my-sa@my-project.iam.gserviceaccount.com",
+        scopes: "https://www.googleapis.com/auth/admin.directory.user",
+        token_url: "https://oauth2.googleapis.com/token",  # optional, this is the default
+        sub: "admin@example.com"                            # optional, for domain-wide delegation
+    },
+    bearer_auth: {
+        digest: Digest::SHA256.base64digest('trustno1')
+    },
+    allowed_hosts: ["oauth2.googleapis.com", "admin.googleapis.com"]
+}
+```
+
+**Usage is a two-step flow:**
+
+Step 1 - Exchange the sealed SA key for a sealed access token:
+
+```ruby
+# Send to the token endpoint through tokenizer
+resp = conn.post("http://oauth2.googleapis.com/token")
+sealed_access_token = JSON.parse(resp.body)["sealed_token"]
+expires_in = JSON.parse(resp.body)["expires_in"]
+```
+
+The response body is replaced with:
+```json
+{"sealed_token": "<base64 sealed InjectProcessor>", "expires_in": 3540, "token_type": "sealed"}
+```
+
+Step 2 - Use the sealed access token for API calls:
+
+```ruby
+conn2 = Faraday.new(
+    proxy: "http://tokenizer.flycast",
+    headers: {
+        proxy_tokenizer: "#{sealed_access_token}",
+        proxy_authorization: "Bearer trustno1"
+    }
+)
+
+conn2.get("http://admin.googleapis.com/admin/directory/v1/users")
+```
+
+The sealed access token is a normal `inject_processor` secret - tokenizer unseals it and injects the `Authorization: Bearer` header. When the token expires (typically after ~1 hour), repeat Step 1.
+
+The `sub` and `scopes` fields can be overridden at request time via parameters, allowing different requests through the same sealed credential to impersonate different users or request different scopes:
+
+```ruby
+processor_params = { sub: "other-admin@example.com", scopes: "https://www.googleapis.com/auth/gmail.readonly" }
+conn.headers[:proxy_tokenizer] = "#{Base64.encode64(sealed_secret)}; #{processor_params.to_json}"
+```
+
+**Fly.io deployment note:** For internal use on Fly.io, consider using `fly-src` auth instead of `bearer_auth`. This ties the sealed secret to a specific Fly machine, so the token is not useful if exfiltrated outside the originating instance.
+
 ## Request-time parameters
 
 If the destination/formatting might vary between requests, `inject_processor` and `inject_hmac_processor` can specify an allowlist of `dst`/`fmt` parameters that the client can specify at request time. These parameters are supplied as JSON in the `Proxy-Tokenizer` header after the encrypted secret.
@@ -107,6 +201,105 @@ conn.headers[:proxy_tokenizer] = "#{Base64.encode64(sealed_secret)}; #{processor
 
 conn.get("http://api.stripe.com")
 ```
+
+### Client credentials processor
+
+The `client_credentials_processor` implements the OAuth2 `client_credentials` grant ([RFC 6749 section 4.4](https://tools.ietf.org/html/rfc6749#section-4.4)) for machine-to-machine auth (HelpScout, and similar API platforms). It follows the same two-step sealed pattern as `jwt_processor` - see that section for the full flow description.
+
+```ruby
+secret = {
+    client_credentials_processor: {
+        client_id: "my-client-id",
+        client_secret: "my-client-secret",
+        token_url: "https://api.helpscout.net/v2/oauth2/token",
+        scopes: "mailbox.read mailbox.write"  # optional
+    },
+    bearer_auth: {
+        digest: Digest::SHA256.base64digest('trustno1')
+    },
+    allowed_hosts: ["api.helpscout.net"]
+}
+```
+
+Step 1 - Exchange the sealed client credentials for a sealed access token (send to the token endpoint through tokenizer):
+
+```ruby
+resp = conn.post("http://api.helpscout.net/v2/oauth2/token")
+sealed_access_token = JSON.parse(resp.body)["sealed_token"]
+```
+
+Step 2 - Use the sealed access token for API calls (same as `jwt_processor`):
+
+```ruby
+conn2 = Faraday.new(
+    proxy: "http://tokenizer.flycast",
+    headers: {
+        proxy_tokenizer: "#{sealed_access_token}",
+        proxy_authorization: "Bearer trustno1"
+    }
+)
+conn2.get("http://api.helpscout.net/v2/conversations")
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `client_id` | yes | OAuth2 client ID |
+| `client_secret` | yes | OAuth2 client secret (sealed, never exposed) |
+| `token_url` | yes | Token endpoint URL |
+| `scopes` | no | Space-separated OAuth2 scopes |
+
+### GitHub App processor
+
+The `github_app_processor` authenticates as a [GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation). It follows the same two-step sealed pattern as `jwt_processor`, but with GitHub's non-standard flow: the JWT goes in the `Authorization` header (not a form body), the request body is empty, and the installation ID lives in the URL path. GitHub requires RSA keys signed with RS256; other key types are rejected.
+
+```ruby
+secret = {
+    github_app_processor: {
+        private_key: File.read("github-app-key.pem"),
+        app_id: "123456",
+        installation_id: "78901234",
+        # token_url: "https://api.github.com/app/installations/{installation_id}/access_tokens"  # default
+    },
+    bearer_auth: {
+        digest: Digest::SHA256.base64digest('trustno1')
+    },
+    allowed_hosts: ["api.github.com"]
+}
+```
+
+Step 1 - Exchange the sealed App key for a sealed installation token. POST to any path on `api.github.com` through tokenizer - the processor rewrites the path using the sealed `installation_id`:
+
+```ruby
+resp = conn.post("http://api.github.com/")
+sealed_installation_token = JSON.parse(resp.body)["sealed_token"]
+```
+
+The response body is replaced with:
+```json
+{"sealed_token": "<base64 sealed InjectProcessor>", "expires_in": 3540, "token_type": "sealed"}
+```
+
+Installation tokens expire after one hour. Repeat step 1 before expiry.
+
+Step 2 - Use the sealed installation token for API calls. Tokenizer injects `Authorization: token <installation_token>` and enforces that the token is only usable against `api.github.com`:
+
+```ruby
+conn2 = Faraday.new(
+    proxy: "http://tokenizer.flycast",
+    headers: {
+        proxy_tokenizer: "#{sealed_installation_token}",
+        proxy_authorization: "Bearer trustno1"
+    }
+)
+conn2.get("http://api.github.com/installation/repositories")
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `private_key` | yes | PEM-encoded RSA private key (sealed, never exposed) |
+| `app_id` | yes | GitHub App ID, used as the JWT `iss` claim |
+| `installation_id` | yes | Installation ID, substituted into `token_url` |
+| `token_url` | no | Token URL template; `{installation_id}` is substituted. Override for GitHub Enterprise. |
 
 ## Host allowlist
 
@@ -178,7 +371,7 @@ export OPEN_KEY=$(openssl rand -hex 32)
 Run the tokenizer server:
 
 ```shell
-tokenizer
+tokenizer serve -use-flysrc=true
 ```
 
 The output will contain the public (seal) key, which can be used for encrypting secrets.

@@ -103,17 +103,25 @@ func TokenizerHostnames(hostnames ...string) Option {
 	}
 }
 
-func NewTokenizer(openKey string, opts ...Option) *tokenizer {
+func ParseOpenKey(openKey string) (*[32]byte, *[32]byte, error) {
 	privBytes, err := hex.DecodeString(openKey)
 	if err != nil {
-		logrus.WithError(err).Panic("bad private key")
+		return nil, nil, fmt.Errorf("bad private key")
 	}
 	if len(privBytes) != 32 {
-		logrus.Panicf("bad private key size: %d", len(privBytes))
+		return nil, nil, fmt.Errorf("bad private key size: %d", len(privBytes))
 	}
 	priv := (*[32]byte)(privBytes)
 	pub := new([32]byte)
 	curve25519.ScalarBaseMult(pub, priv)
+	return priv, pub, nil
+}
+
+func NewTokenizer(openKey string, opts ...Option) *tokenizer {
+	priv, pub, err := ParseOpenKey(openKey)
+	if err != nil {
+		logrus.WithError(err).Panic(err.Error())
+	}
 
 	proxy := goproxy.NewProxyHttpServer()
 	tkz := &tokenizer{ProxyHttpServer: proxy, priv: priv, pub: pub, flysrcParser: nil}
@@ -191,6 +199,11 @@ type proxyUserData struct {
 	// tunneled connection.
 	connectProcessors []RequestProcessor
 
+	// responseProcessors are invoked in HandleResponse to transform the
+	// upstream response before returning it to the caller. Currently only
+	// JWTProcessorConfig uses this to seal the access token.
+	responseProcessors []func(*http.Response) error
+
 	// start time of the CONNECT request if this is a tunneled connection.
 	connectStart time.Time
 	connLog      logrus.FieldLogger
@@ -223,9 +236,9 @@ func (t *tokenizer) HandleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.
 		return goproxy.RejectConnect, ""
 	}
 
-	connectProcessors, safeSecret, err := t.processorsFromRequest(ctx.Req)
-	if safeSecret != "" {
-		pud.connLog = pud.connLog.WithField("secret", safeSecret)
+	connResult, err := t.processorsFromRequest(ctx.Req)
+	if len(connResult.safeSecrets) > 0 {
+		pud.connLog = pud.connLog.WithField("secrets", connResult.safeSecrets)
 	}
 	if err != nil {
 		pud.connLog.WithError(err).Warn("find processor (CONNECT)")
@@ -233,7 +246,7 @@ func (t *tokenizer) HandleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.
 		return goproxy.RejectConnect, ""
 	}
 
-	pud.connectProcessors = connectProcessors
+	pud.connectProcessors = connResult.request
 	ctx.UserData = pud
 
 	return goproxy.HTTPMitmConnect, host
@@ -296,15 +309,16 @@ func (t *tokenizer) HandleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 	}
 
 	processors := append([]RequestProcessor(nil), pud.connectProcessors...)
-	reqProcessors, safeSecret, err := t.processorsFromRequest(req)
-	if safeSecret != "" {
-		pud.reqLog = pud.reqLog.WithField("secret", safeSecret)
+	reqResult, err := t.processorsFromRequest(req)
+	if len(reqResult.safeSecrets) > 0 {
+		pud.reqLog = pud.reqLog.WithField("secrets", reqResult.safeSecrets)
 	}
 	if err != nil {
 		pud.reqLog.WithError(err).Warn("find processor")
 		return req, errorResponse(err)
 	} else {
-		processors = append(processors, reqProcessors...)
+		processors = append(processors, reqResult.request...)
+		pud.responseProcessors = append(pud.responseProcessors, reqResult.response...)
 	}
 
 	if len(processors) == 0 && !t.OpenProxy {
@@ -353,11 +367,20 @@ func (t *tokenizer) HandleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	if resp != nil {
 		log = log.WithField("status", resp.StatusCode)
 		resp.Header.Set("Connection", "close")
+
+		// Run response processors (e.g. JWT token sealing)
+		for _, rp := range pud.responseProcessors {
+			if err := rp(resp); err != nil {
+				log.WithError(err).Warn("run response processor")
+				return errorResponse(err)
+			}
+		}
 	}
 
 	// reset pud for next request in tunnel
 	pud.requestStart = time.Time{}
 	pud.reqLog = nil
+	pud.responseProcessors = nil
 
 	if ctx.Error != nil {
 		log.WithError(ctx.Error).Warn()
@@ -369,51 +392,95 @@ func (t *tokenizer) HandleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	return resp
 }
 
-func (t *tokenizer) processorsFromRequest(req *http.Request) ([]RequestProcessor, string, error) {
-	hdrs := req.Header[headerProxyTokenizer]
-	processors := make([]RequestProcessor, 0, len(hdrs))
+// loggerSecret holds one secret and params from the Proxy-Tokenizer header for logging.
+// The secrets are sanitized of their hazmat.
+type loggerSecret struct {
+	Secret string `json:"secret"`
+	Params string `json:"params"`
+}
 
-	var safeSecret string
+type processorsResult struct {
+	request     []RequestProcessor
+	response    []func(*http.Response) error
+	safeSecrets []loggerSecret
+}
+
+// OpenSealed decodes and unseals a sealed token and returns its raw (unparsed) contents.
+func (t *tokenizer) OpenSealed(b64Secret string) ([]byte, error) {
+	ctSecret, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Secret))
+	if err != nil {
+		return nil, fmt.Errorf("bad Proxy-Tokenizer encoding: %w", err)
+	}
+
+	jsonSecret, ok := box.OpenAnonymous(nil, ctSecret, t.pub, t.priv)
+	if !ok {
+		return nil, errors.New("failed Proxy-Tokenizer decryption")
+	}
+	return jsonSecret, nil
+}
+
+func (t *tokenizer) processorsFromRequest(req *http.Request) (*processorsResult, error) {
+	hdrs := req.Header[headerProxyTokenizer]
+	result := &processorsResult{
+		request: make([]RequestProcessor, 0, len(hdrs)),
+	}
+
 	for _, hdr := range hdrs {
 		b64Secret, params, err := parseHeaderProxyTokenizer(hdr)
 		if err != nil {
-			return nil, safeSecret, err
+			return result, err
 		}
 
-		ctSecret, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Secret))
+		jsonSecret, err := t.OpenSealed(b64Secret)
 		if err != nil {
-			return nil, safeSecret, fmt.Errorf("bad Proxy-Tokenizer encoding: %w", err)
-		}
-
-		jsonSecret, ok := box.OpenAnonymous(nil, ctSecret, t.pub, t.priv)
-		if !ok {
-			return nil, safeSecret, errors.New("failed Proxy-Tokenizer decryption")
+			return result, err
 		}
 
 		secret := new(Secret)
 		if err = json.Unmarshal(jsonSecret, secret); err != nil {
-			return nil, safeSecret, fmt.Errorf("bad secret json: %w", err)
+			return result, fmt.Errorf("bad secret json: %w", err)
 		}
 
-		safeSecret = secret.StripHazmatString()
+		// capture secret and params for logger
+		safeSecret := secret.StripHazmatString()
+		pstr, _ := json.Marshal(params)
+		result.safeSecrets = append(result.safeSecrets, loggerSecret{safeSecret, string(pstr)})
+
 		if err = secret.AuthRequest(t, req); err != nil {
-			return nil, safeSecret, fmt.Errorf("unauthorized to use secret: %w", err)
+			return result, fmt.Errorf("unauthorized to use secret: %w", err)
 		}
 
 		for _, v := range secret.RequestValidators {
 			if err := v.Validate(req); err != nil {
-				return nil, safeSecret, fmt.Errorf("request validator failed: %w", err)
+				return result, fmt.Errorf("request validator failed: %w", err)
 			}
 		}
 
-		processor, err := secret.Processor(params)
-		if err != nil {
-			return nil, safeSecret, err
+		sealCtx := &SealingContext{
+			AuthConfig:        secret.AuthConfig,
+			RequestValidators: secret.RequestValidators,
+			SealKey:           t.pub,
 		}
-		processors = append(processors, processor)
+
+		processor, err := secret.Processor(params, sealCtx)
+		if err != nil {
+			return result, err
+		}
+		result.request = append(result.request, processor)
+
+		// Check if the processor also handles responses
+		if rpc, ok := secret.ProcessorConfig.(ResponseProcessorConfig); ok {
+			respProc, err := rpc.ResponseProcessor(params, sealCtx)
+			if err != nil {
+				return result, err
+			}
+			if respProc != nil {
+				result.response = append(result.response, respProc)
+			}
+		}
 	}
 
-	return processors, safeSecret, nil
+	return result, nil
 }
 
 func parseHeaderProxyTokenizer(hdr string) (string, map[string]string, error) {
