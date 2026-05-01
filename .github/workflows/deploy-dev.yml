@@ -19,6 +19,7 @@ jobs:
           dockerfile: Dockerfile
       - run: go test -v ./...
 
+  # TODO: this step cannot be rerun after success (tag is immutable in ECR...)
   build-and-push-tokenizer:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
