@@ -15,6 +15,8 @@ jobs:
     secrets: inherit
     with:
       region: us-east-2
+      role-to-assume: arn:aws:iam::${{ vars.project_number }}:role/${{ vars.role_name }}
+      registry: ${{ vars.project_number }}
       cluster-name: prod
       repo-name: tokenizer
       task-family: prod-tokenizer

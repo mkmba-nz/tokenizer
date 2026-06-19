@@ -27,6 +27,7 @@ jobs:
     uses: mkmba-nz/github-infra/.github/workflows/build-and-push.yml@main
     secrets: inherit
     with:
+      role-to-assume: arn:aws:iam::${{ vars.project_number }}:role/${{ vars.role_name }}
       repo-name: tokenizer
       context: .
 
@@ -38,6 +39,8 @@ jobs:
       secrets: inherit
       with:
         region: ap-southeast-2
+        role-to-assume: arn:aws:iam::${{ vars.project_number }}:role/${{ vars.role_name }}
+        registry: ${{ vars.project_number }}
         cluster-name: dev
         repo-name: tokenizer
         task-family: dev-tokenizer
